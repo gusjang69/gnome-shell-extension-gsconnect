@@ -76,6 +76,59 @@ function getShortTime(time) {
     }
 }
 
+function getDisplayNumber(contact, address) {
+    let number = address.toPhoneNumber();
+
+    for (let contactNumber of contact.numbers) {
+        let cnumber = contactNumber.value.toPhoneNumber();
+
+        if (number.endsWith(cnumber) || cnumber.endsWith(number)) {
+            return contactNumber.value;
+        }
+    }
+
+    return address;
+}
+
+function threadHasAddress(thread, addressObj) {
+    let number = addressObj.address;
+
+    for (let taddressObj of thread[0].addresses) {
+        let tnumber = taddressObj.address;
+
+        if (number.endsWith(tnumber) || tnumber.endsWith(number)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function getThreadIdForAddresses(smsPlugin, addresses) {
+
+    for (let thread of Object.values(smsPlugin.conversations)) {
+        if (addresses.length !== thread[0].addresses.length) continue;
+
+        if (addresses.every(address => threadHasAddress(thread, address))) {
+            return thread[0].thread_id;
+        }
+    }
+
+    return null;
+}
+
+function getContactsForAddresses(device, addresses) {
+    let contacts = {};
+
+    for (let i = 0, len = addresses.length; i < len; i++) {
+        let address = addresses[i].address;
+
+        contacts[address] = device.contacts.query({
+            number: address
+        });
+    }
+}
+
 
 /**
  * A simple GtkLabel subclass with a chat bubble appearance
@@ -134,8 +187,11 @@ var ConversationMessage = GObject.registerClass({
 const ConversationSummary = GObject.registerClass({
     GTypeName: 'GSConnectConversationSummary'
 }, class ConversationSummary extends Gtk.ListBoxRow {
-    _init(contact, message) {
+    _init(contacts, message) {
         super._init({visible: true});
+
+        this._lastSender = message.addresses[0].address;
+        this._lastContact = contacts[this._lastSender];
 
         // Row layout
         let grid = new Gtk.Grid({
@@ -146,7 +202,7 @@ const ConversationSummary = GObject.registerClass({
         this.add(grid);
 
         // Contact Avatar
-        this._avatar = new Contacts.Avatar(contact);
+        this._avatar = new Contacts.Avatar(this._lastContact);
         grid.attach(this._avatar, 0, 0, 1, 3);
 
         // Contact Name
@@ -181,15 +237,15 @@ const ConversationSummary = GObject.registerClass({
         });
         grid.attach(this._body, 1, 1, 2, 1);
 
-        this.contact = contact;
-        this._message = message;
+        this.contacts = contacts;
+        this.message = message;
     }
 
     get date() {
         return this._message.date;
     }
 
-    get id() {
+    get thread_id() {
         return this._message.thread_id;
     }
 
@@ -200,8 +256,18 @@ const ConversationSummary = GObject.registerClass({
     set message(message) {
         this._message = message;
 
+        // Update avatar
+        let currentSender = message.addresses[0].address;
+
+        if (this._lastSender !== currentSender) {
+            this._lastSender = currentSender;
+            this._lastContact = this.contacts[this._lastSender];
+
+            this._avatar.path = this._lastContact.avatar;
+        }
+
         // Contact Name & Message body
-        let nameLabel = this.contact.name;
+        let nameLabel = this._lastContact.name;
         let bodyLabel = message.body.split(/\r|\n/)[0];
         bodyLabel = GLib.markup_escape_text(bodyLabel, -1);
 
@@ -235,6 +301,14 @@ const ConversationSummary = GObject.registerClass({
 const ConversationWidget = GObject.registerClass({
     GTypeName: 'GSConnectConversationWidget',
     Properties: {
+        'addresses': GObject.param_spec_variant(
+            'addresses',
+            'Addresses',
+            'The target phone numbers or other addresses',
+            new GLib.VariantType('as'),
+            null,
+            GObject.ParamFlags.READWRITE | GObject.ParamFlags.CONSTRUCT_ONLY
+        ),
         'device': GObject.ParamSpec.object(
             'device',
             'Device',
@@ -255,6 +329,13 @@ const ConversationWidget = GObject.registerClass({
             'Whether there are sent messages pending confirmation',
             GObject.ParamFlags.READABLE,
             false
+        ),
+        'thread-id': GObject.ParamSpec.string(
+            'thread-id',
+            'Thread ID',
+            'The current thread',
+            GObject.ParamFlags.READWRITE | GObject.ParamFlags.CONSTRUCT_ONLY,
+            ''
         )
     },
     Template: 'resource:///org/gnome/Shell/Extensions/GSConnect/conversation.ui',
@@ -316,13 +397,37 @@ const ConversationWidget = GObject.registerClass({
         this._address = value;
     }
 
-    get contact() {
-        // Ensure we have a contact and hold a reference to it
-        if (!this._contact) {
-            this._contact = this.device.contacts.query({number: this.address});
+    get addresses() {
+        if (this._addresses === undefined) {
+            this._addresses = [];
         }
 
-        return this._contact;
+        return this._addresses;
+    }
+
+    set addresses(addresses) {
+        if (!addresses) {
+            addresses = [];
+            return;
+        }
+
+        for (let i = 0, len = addresses.length; i < len; i++) {
+            let address = addresses[i].address;
+
+            this.contacts[address] = this.device.contacts.query({
+                number: address
+            });
+        }
+
+        this._addresses = addresses;
+    }
+
+    get contacts() {
+        if (this._contacts === undefined) {
+            this._contacts = {};
+        }
+
+        return this._contacts;
     }
 
     get has_pending() {
@@ -335,6 +440,24 @@ const ConversationWidget = GObject.registerClass({
         }
 
         return this._sms;
+    }
+
+    get thread_id() {
+        if (this._thread_id === undefined) {
+            this._thread_id = null;
+        }
+
+        return this._thread_id;
+    }
+
+    set thread_id(thread_id) {
+        let message = this.sms.conversations[thread_id][0];
+
+        if (message && this.addresses.length === 0) {
+            this.addresses = message.addresses;
+        }
+
+        this._thread_id = thread_id;
     }
 
     _onConnected(device) {
@@ -363,21 +486,13 @@ const ConversationWidget = GObject.registerClass({
         this.__pos = 0;
         this.__messages = [];
 
-        // Try and find a conversation for this number
-        let number = this.address.toPhoneNumber();
-        let thread_id = null;
-
-        for (let thread of Object.values(this.sms.conversations)) {
-            let tnumber = thread[0].address.toPhoneNumber();
-
-            if (number.endsWith(tnumber) || tnumber.endsWith(number)) {
-                thread_id = thread[0].thread_id;
-                break;
-            }
+        // Try and find a thread_id for this number
+        if (this.thread_id === null) {
+            getThreadIdForAddresses(this.sms, this.addresses);
         }
 
-        if (this.sms.conversations[thread_id]) {
-            this.__messages = this.sms.conversations[thread_id].slice(0);
+        if (this.sms.conversations[this.thread_id]) {
+            this.__messages = this.sms.conversations[this.thread_id].slice(0);
             this._populateBack();
         }
     }
@@ -393,7 +508,8 @@ const ConversationWidget = GObject.registerClass({
             let message = this.__messages[this.__messages.length - 1];
 
             // TODO: Unsupported MessageType
-            if (message.type !== 1 && message.type !== 2) {
+            if (message.type !== Sms.MessageType.INBOX &&
+                message.type !== Sms.MessageType.SENT) {
                 this.__messages.pop();
                 continue;
             }
@@ -415,6 +531,11 @@ const ConversationWidget = GObject.registerClass({
                 this.__first = this._createSeries(message);
                 this.message_list.prepend(this.__first);
 
+            // ...or it's from a different sender
+            } else if (message.addresses[0].address !== this.__first.message.addresses[0].address) {
+                this.__first = this._createSeries(message);
+                this.message_list.prepend(this.__first);
+
             // ...or it's in a different direction
             } else if (message.type !== this.__first.type) {
                 this.__first = this._createSeries(message);
@@ -423,6 +544,7 @@ const ConversationWidget = GObject.registerClass({
 
             // Create a message, set the message id and prepend it
             let widget = new ConversationMessage(this.__messages.pop());
+            this.__first.message = message;
             this.__first.date = message.date;
             this.__first.messages.pack_end(widget, false, false, 0);
 
@@ -506,7 +628,15 @@ const ConversationWidget = GObject.registerClass({
 
         // Add avatar for incoming messages
         if (incoming) {
-            let avatar = new Contacts.Avatar(this.contact);
+            let address = message.addresses[0].address;
+
+            if (this.contacts[address] === undefined) {
+                this.contacts[address] = this.device.contacts.query({
+                    number: address
+                });
+            }
+
+            let avatar = new Contacts.Avatar(this.contacts[address]);
             avatar.valign = Gtk.Align.END;
             layout.add(avatar);
         }
@@ -554,6 +684,11 @@ const ConversationWidget = GObject.registerClass({
             this.__last = this._createSeries(message);
             this.message_list.add(this.__last);
 
+        // ...or it's from a different sender
+        } else if (message.addresses[0].address !== this.__last.message.addresses[0].address) {
+            this.__last = this._createSeries(message);
+            this.message_list.add(this.__last);
+
         // ...or it's in a different direction
         } else if (message.type !== this.__last.type) {
             this.__last = this._createSeries(message);
@@ -562,6 +697,7 @@ const ConversationWidget = GObject.registerClass({
 
         // Create a message, set the message id/date and append it
         let widget = new ConversationMessage(message);
+        this.__last.message = message;
         this.__last.date = message.date;
         this.__last.messages.pack_start(widget, false, false, 0);
 
@@ -637,6 +773,13 @@ var Window = GObject.registerClass({
             'The device associated with this window',
             GObject.ParamFlags.READWRITE | GObject.ParamFlags.CONSTRUCT_ONLY,
             GObject.Object
+        ),
+        'thread-id': GObject.ParamSpec.string(
+            'thread-id',
+            'Thread ID',
+            'The current thread',
+            GObject.ParamFlags.READWRITE,
+            ''
         )
     },
     Template: 'resource:///org/gnome/Shell/Extensions/GSConnect/messaging.ui',
@@ -714,6 +857,7 @@ var Window = GObject.registerClass({
     }
 
     set address(address) {
+        // Reset to the empty placeholder
         if (!address) {
             this.conversation_list.select_row(null);
             this.conversation_stack.set_visible_child_name('placeholder');
@@ -725,19 +869,7 @@ var Window = GObject.registerClass({
 
         // Set the header bar title/subtitle
         this.headerbar.title = contact.name;
-        this.headerbar.subtitle = address;
-
-        // See if we have a nicer display number
-        let number = address.toPhoneNumber();
-
-        for (let contactNumber of contact.numbers) {
-            let cnumber = contactNumber.value.toPhoneNumber();
-
-            if (number.endsWith(cnumber) || cnumber.endsWith(number)) {
-                this.headerbar.subtitle = contactNumber.value;
-                break;
-            }
-        }
+        this.headerbar.subtitle = getDisplayNumber(contact, address);
 
         // Create a conversation widget if there isn't one
         let conversation = this.getConversation(address);
@@ -751,7 +883,7 @@ var Window = GObject.registerClass({
             this.conversation_stack.add_named(conversation, address);
         }
 
-        // Select the conversation and entry active
+        // Set the conversation and entry active
         this.conversation_stack.visible_child = conversation;
         this.conversation_stack.visible_child.message_entry.has_focus = true;
 
@@ -768,6 +900,73 @@ var Window = GObject.registerClass({
         }
 
         return this._sms;
+    }
+
+    get thread_id() {
+        if (this._thread_id === undefined) {
+            this._thread_id = null;
+        }
+
+        return this._thread_id;
+    }
+
+    set thread_id(thread_id) {
+        // Reset to the empty placeholder
+        if (!thread_id) {
+            this.conversation_list.select_row(null);
+            this.conversation_stack.set_visible_child_name('placeholder');
+            return;
+        }
+
+        // Create a conversation widget if there isn't one
+        let conversation = this.conversation_stack.get_child_by_name(thread_id);
+
+        if (conversation === null) {
+            conversation = new ConversationWidget({
+                device: this.device,
+                thread_id: thread_id
+            });
+
+            this.conversation_stack.add_named(conversation, thread_id);
+        }
+
+        // Figure out whether this is a multi-recipient thread
+        let addresses = this.sms.conversations[thread_id][0].addresses;
+
+        if (addresses.length === 1) {
+            // Get a contact object for this address
+            let address = addresses[0].address;
+            let contact = this.device.contacts.query({number: address});
+
+            // Set the header bar title/subtitle
+            this.headerbar.title = contact.name;
+            this.headerbar.subtitle = getDisplayNumber(contact, address);
+
+        } else {
+            let firstAddress = addresses[0].address;
+            let firstContact = conversation.contacts[firstAddress];
+            let otherLength = addresses.length - 1;
+
+            this.headerbar.title = firstContact.name;
+            this.headerbar.subtitle = ngettext(
+                'And %d other contact',
+                'And %d others',
+                otherLength
+            ).format(otherLength);
+        }
+
+        // Select the conversation and entry active
+        this.conversation_stack.visible_child = conversation;
+        this.conversation_stack.visible_child.message_entry.has_focus = true;
+
+        // There was a pending message waiting for a conversation to be chosen
+        if (this._pendingShare) {
+            conversation.setMessage(this._pendingShare);
+            this._pendingShare = null;
+        }
+
+        this._thread_id = thread_id;
+        this.notify('thread_id');
     }
 
     _sync() {
@@ -817,33 +1016,44 @@ var Window = GObject.registerClass({
 
         // Update existing summaries and destroy old ones
         for (let summary of this.conversation_list.get_children()) {
-            let message = messages.get(summary.id);
+            let message = messages.get(summary.thread_id);
 
             // If it's an existing conversation, update it
             if (message) {
                 summary.message = message;
-                messages.delete(summary.id);
+                messages.delete(summary.thread_id);
 
             // Otherwise destroy it
             } else {
-                // HACK: temporary mitigator for mysterious GtkListBox leak
-                summary.run_dispose();
-                imports.system.gc();
-
-                // Also delete the conversation
-                let conversation = this.getConversation(summary.message.address);
+                // Destroy the conversation widget
+                let conversation = this.getConversationByThread(summary.thread_id);
 
                 if (conversation) {
                     conversation.run_dispose();
                     imports.system.gc();
                 }
+
+                // Then the summary widget
+                // HACK: temporary mitigator for mysterious GtkListBox leak
+                summary.run_dispose();
+                imports.system.gc();
             }
         }
 
-        // Add new summaries
+        // What's left in the map is new summaries
         for (let message of messages.values()) {
-            let contact = this.device.contacts.query({number: message.address});
-            let conversation = new ConversationSummary(contact, message);
+            let addresses = message.addresses;
+            let contacts = {};
+
+            for (let i = 0, len = addresses.length; i < len; i++) {
+                let address = addresses[i].address;
+
+                contacts[address] = this.device.contacts.query({
+                    number: address
+                });
+            }
+
+            let conversation = new ConversationSummary(contacts, message);
             this.conversation_list.add(conversation);
         }
 
@@ -854,7 +1064,7 @@ var Window = GObject.registerClass({
     _onConversationSelected(box, row) {
         // Show the conversation for this number (if applicable)
         if (row) {
-            this.address = row.message.address;
+            this.thread_id = row.thread_id;
 
         // Show the placeholder
         } else {
@@ -873,6 +1083,54 @@ var Window = GObject.registerClass({
         }
 
         return GLib.SOURCE_CONTINUE;
+    }
+
+    _hasAddress(haystack, needle) {
+        let number = needle.address;
+
+        for (let haystackObj of haystack) {
+            let tnumber = haystackObj.address;
+
+            if (number.endsWith(tnumber) || tnumber.endsWith(number)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    getConversationForMessage(message) {
+        // This shouldn't happen
+        if (message === null) return null;
+
+        // First try to find a conversation by thread_id
+        let thread_id = message.thread_id;
+        let conversation = this.conversation_stack.get_child_by_name(thread_id);
+
+        if (conversation !== null) {
+            return conversation;
+        }
+
+        // Try and find one by matching addresses, which is necessary if we've
+        // started a thread locally and haven't set the thread_id
+        let addresses = message.addresses;
+
+        for (let conversation of this.conversation_stack.get_children()) {
+            if (conversation.addresses === undefined ||
+                conversation.addresses.length !== addresses.length) {
+                continue;
+            }
+
+            let caddrs = conversation.addresses;
+
+            // If we find a match set the thread_id on the conversation
+            if (addresses.every(addr => this._hasAddress(caddrs, addr))) {
+                conversation._thread_id = thread_id;
+                return conversation;
+            }
+        }
+
+        return null;
     }
 
     /**

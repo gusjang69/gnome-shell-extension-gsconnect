@@ -248,6 +248,22 @@ var Plugin = GObject.registerClass({
     }
 
     cacheLoaded() {
+        // Backwards compatibility with single-address format
+        let threads = this.conversations.values();
+
+        if (threads.length > 0 && threads[0][0].address) {
+            for (let t = 0, n_threads = threads.length; t < n_threads; t++) {
+                let thread = n_threads[t];
+
+                for (let m = 0, n_msgs = thread.length; m < n_msgs; m++) {
+                    let message = thread[m];
+
+                    message.addresses = [{address: message.address}];
+                    delete message.address;
+                }
+            }
+        }
+
         this.notify('conversations');
     }
 
@@ -264,7 +280,7 @@ var Plugin = GObject.registerClass({
 
         // If the window is open, try and find an active conversation
         if (this._window) {
-            conversation = this._window.getConversation(message.address);
+            conversation = this._window.getConversationByThread(message.thread_id);
         }
 
         // If there's an active conversation, we should log the message now
@@ -280,8 +296,18 @@ var Plugin = GObject.registerClass({
      */
     async _handleConversation(messages) {
         try {
-            // If the address is missing this will cause problems...
-            if (!messages[0].address) return;
+            // Backwards compatibility
+            if (messages[0].address) {
+                for (let i = 0, len = messages.length; i < len; i++) {
+                    let message = messages[i];
+
+                    message.addresses = [{address: message.address}];
+                    delete message.address;
+                }
+            }
+
+            // If there are no addresses this will cause major problems...
+            if (!messages[0].addresses || !messages[0].addresses[0]) return;
 
             let thread_id = messages[0].thread_id;
             let conversation = this.conversations[thread_id] || [];
