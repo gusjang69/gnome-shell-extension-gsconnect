@@ -7,16 +7,25 @@ developers for the sister Python script 'kdeconnect-send-nautilus.py':
 https://github.com/Bajoja/indicator-kdeconnect/blob/master/data/extensions/kdeconnect-send-nautilus.py
 """
 
+# Force Nautilus integration, for testing
+FILE_MANAGER="Nautilus"
+
 import gettext
 import locale
 import os.path
 
 import gi
-gi.require_version('Nautilus', '3.0')
 gi.require_version('Gio', '2.0')
 gi.require_version('GLib', '2.0')
 gi.require_version('GObject', '2.0')
-from gi.repository import Nautilus, Gio, GLib, GObject
+from gi.repository import Gio, GLib, GObject
+
+if "Nemo" in FILE_MANAGER:
+    gi.require_version('Nemo', '3.0')
+    from gi.repository import Nemo as FileManager
+elif "Nautilus" in FILE_MANAGER:
+    gi.require_version('Nautilus', '3.0')
+    from gi.repository import Nautilus as FileManager
 
 _ = gettext.gettext
 
@@ -34,7 +43,7 @@ SERVICE_PATH = '/org/gnome/Shell/Extensions/GSConnect'
 
 
 
-class GSConnectShareExtension(GObject.Object, Nautilus.MenuProvider):
+class GSConnectShareExtension(GObject.Object, FileManager.MenuProvider):
     """A context menu for sending files via GSConnect."""
 
     def __init__(self):
@@ -144,18 +153,18 @@ class GSConnectShareExtension(GObject.Object, Nautilus.MenuProvider):
             return ()
 
         # Context Menu Item
-        menu = Nautilus.MenuItem(
+        menu = FileManager.MenuItem(
             name='GSConnectShareExtension::Devices',
             label=_('Send To Mobile Device')
         )
 
         # Context Submenu
-        submenu = Nautilus.Menu()
+        submenu = FileManager.Menu()
         menu.set_submenu(submenu)
 
         # Context Submenu Items
         for name, action_group in devices:
-            item = Nautilus.MenuItem(
+            item = FileManager.MenuItem(
                 name='GSConnectShareExtension::Device' + name,
                 label=name
             )
